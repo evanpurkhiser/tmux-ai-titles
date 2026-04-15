@@ -14,9 +14,19 @@ use std::time::{Duration, Instant};
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠚", "⠞", "⠖", "⠦", "⠴", "⠲", "⠳", "⠓"];
 
-const PANE_TITLE_PROMPT: &str = "Based on the terminal output below, generate a 4-5 word title describing what this terminal pane is being used for. Output ONLY the title, nothing else. No quotes, no punctuation. The output may be empty or minimal — for idle or empty terminals, use a title like \"Idle Shell\".";
+const PANE_TITLE_PROMPT: &str = "\
+Generate a 4-5 word title for a tmux pane. Focus on the specific task or activity \
+visible in the output — e.g. \"Editing Rust build config\" not \"Terminal Session\". \
+Use the working directory and previous title for context when the output alone is ambiguous. \
+For empty or idle shells, use \"Idle\" followed by the directory basename. \
+Output ONLY the title. No quotes, no punctuation, no explanation.";
 
-const WINDOW_TITLE_PROMPT: &str = "You are given a list of short pane titles from a tmux window. Each title describes what one terminal pane is being used for. Summarize them into a 1-2 word window title that captures the overall theme or project. Output ONLY the 1-2 word title, nothing else. No quotes, no punctuation, no explanation.";
+const WINDOW_TITLE_PROMPT: &str = "\
+Generate a 1-2 word tmux window title from these pane descriptions. \
+The title should capture the project or theme — e.g. a window with panes doing \
+Rust builds, editing source, and running tests might be titled \"Rust Dev\". \
+Each entry includes the pane title and its working directory for context. \
+Output ONLY the title. No quotes, no punctuation, no explanation.";
 
 /// AI-powered title generation for tmux panes and windows
 #[derive(Parser)]
