@@ -166,6 +166,41 @@ type TitleMap = Arc<Mutex<HashMap<String, String>>>;
 /// Set of pane/window IDs currently being processed by a background thread
 type InFlight = Arc<Mutex<HashSet<String>>>;
 
+struct SignalState {
+    should_stop: bool,
+    should_regenerate: bool,
+}
+
+struct SignalNotifier {
+    state: Mutex<SignalState>,
+    cvar: Condvar,
+}
+
+impl SignalNotifier {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(SignalState {
+                should_stop: false,
+                should_regenerate: false,
+            }),
+            cvar: Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, SignalState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn notify(&self) {
+        self.cvar.notify_one();
+    }
+
+    fn wait_timeout(&self, timeout: Duration) {
+        let state = self.lock();
+        let _ = self.cvar.wait_timeout(state, timeout);
+    }
+}
+
 /// RAII guard that sets an AtomicBool to true on drop, ensuring the spinner
 /// stops even if the generation function panics.
 struct SpinnerGuard {
@@ -482,23 +517,22 @@ fn cmd_start(args: StartArgs) {
     let in_flight: InFlight = Arc::new(Mutex::new(HashSet::new()));
     let model: Arc<str> = Arc::from(args.model.as_str());
 
-    // Signal state: (should_stop, should_regenerate)
-    let signal_state = Arc::new((Mutex::new((false, false)), Condvar::new()));
+    let signals_notifier = Arc::new(SignalNotifier::new());
 
     let mut signals = Signals::new([SIGTERM, SIGHUP]).expect("failed to register signal handlers");
 
     {
-        let signal_state = signal_state.clone();
+        let notifier = signals_notifier.clone();
         thread::spawn(move || {
             for sig in signals.forever() {
-                let (lock, cvar) = &*signal_state;
-                let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+                let mut state = notifier.lock();
                 match sig {
-                    SIGTERM => state.0 = true,
-                    SIGHUP => state.1 = true,
+                    SIGTERM => state.should_stop = true,
+                    SIGHUP => state.should_regenerate = true,
                     _ => continue,
                 }
-                cvar.notify_one();
+                drop(state);
+                notifier.notify();
             }
         });
     }
@@ -513,18 +547,17 @@ fn cmd_start(args: StartArgs) {
 
     loop {
         {
-            let (lock, _) = &*signal_state;
-            let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = signals_notifier.lock();
 
-            if state.0 {
+            if state.should_stop {
                 eprintln!("tmux-ai-titles: received SIGTERM, shutting down");
                 remove_pid_file();
                 break;
             }
 
-            if state.1 {
+            if state.should_regenerate {
                 eprintln!("tmux-ai-titles: received SIGHUP, clearing generated flags");
-                state.1 = false;
+                state.should_regenerate = false;
                 for s in pane_states.values_mut() {
                     s.has_generated = false;
                 }
@@ -664,9 +697,7 @@ fn cmd_start(args: StartArgs) {
         }
 
         // Wait for poll interval or until a signal wakes us
-        let (lock, cvar) = &*signal_state;
-        let state = lock.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = cvar.wait_timeout(state, poll_interval);
+        signals_notifier.wait_timeout(poll_interval);
     }
 }
 
