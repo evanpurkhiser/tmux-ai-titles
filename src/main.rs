@@ -1,17 +1,23 @@
 use std::collections::HashMap;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 const CLAUDE_PATH: &str = "/Users/evan/.local/bin/claude";
 const LINE_THRESHOLD: usize = 200;
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
+const SPINNER_INTERVAL: Duration = Duration::from_millis(80);
 const CAPTURE_LINES: usize = 500;
+
+const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 #[derive(Debug)]
 struct PaneState {
     history_size: usize,
     last_generated_at: usize,
+    generating: bool,
 }
 
 struct PaneInfo {
@@ -67,6 +73,7 @@ fn generate_title(buffer: &str) -> Option<String> {
     let mut child = Command::new(CLAUDE_PATH)
         .args([
             "-p",
+            "--model", "haiku",
             "Based on this terminal output, generate a 4-5 word title describing what this terminal pane is being used for. Output ONLY the title, nothing else. No quotes, no punctuation.",
         ])
         .stdin(std::process::Stdio::piped())
@@ -99,6 +106,34 @@ fn set_pane_title(pane_id: &str, title: &str) {
         .ok();
 }
 
+fn spawn_title_generation(pane_id: String, buffer: String) {
+    thread::spawn(move || {
+        let done = Arc::new(AtomicBool::new(false));
+        let done_clone = done.clone();
+        let pane_id_clone = pane_id.clone();
+
+        // Spinner thread
+        let spinner = thread::spawn(move || {
+            let mut frame = 0;
+            while !done_clone.load(Ordering::Relaxed) {
+                set_pane_title(&pane_id_clone, SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]);
+                frame += 1;
+                thread::sleep(SPINNER_INTERVAL);
+            }
+        });
+
+        // Generate title
+        let title = generate_title(&buffer);
+        done.store(true, Ordering::Relaxed);
+        spinner.join().ok();
+
+        if let Some(title) = title {
+            set_pane_title(&pane_id, &title);
+            eprintln!("pane-title-daemon: {} -> {:?}", pane_id, title);
+        }
+    });
+}
+
 fn main() {
     eprintln!("pane-title-daemon: starting");
 
@@ -115,25 +150,25 @@ fn main() {
             let state = states.entry(pane.pane_id.clone()).or_insert(PaneState {
                 history_size: pane.history_size,
                 last_generated_at: pane.history_size,
+                generating: false,
             });
 
             state.history_size = pane.history_size;
             let lines_since = pane.history_size.saturating_sub(state.last_generated_at);
 
-            if lines_since >= LINE_THRESHOLD {
+            if lines_since >= LINE_THRESHOLD && !state.generating {
                 eprintln!(
                     "pane-title-daemon: generating title for {} ({lines_since} new lines)",
                     pane.pane_id
                 );
 
                 if let Some(buffer) = capture_pane(&pane.pane_id) {
-                    if let Some(title) = generate_title(&buffer) {
-                        set_pane_title(&pane.pane_id, &title);
-                        eprintln!("pane-title-daemon: {} -> {:?}", pane.pane_id, title);
-                    }
+                    state.generating = true;
+                    spawn_title_generation(pane.pane_id.clone(), buffer);
                 }
 
                 state.last_generated_at = pane.history_size;
+                state.generating = false;
             }
         }
 
