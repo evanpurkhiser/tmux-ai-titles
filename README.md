@@ -21,7 +21,7 @@ The generated title is available in tmux as `#{pane_title}`, which can be used i
 
 ```bash
 cargo build --release
-cp target/release/pane-title-daemon ~/.local/bin/
+cp target/release/tmux-ai-titles ~/.local/bin/
 ```
 
 ## tmux configuration
@@ -34,7 +34,7 @@ set -g pane-border-status top
 set -g pane-border-format "#{pane_index} #{pane_title}"
 
 # Start the daemon when tmux launches
-run-shell "pgrep -f pane-title-daemon >/dev/null || pane-title-daemon &"
+run-shell "pgrep -f tmux-ai-titles >/dev/null || tmux-ai-titles &"
 ```
 
 ## Configuration

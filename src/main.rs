@@ -193,7 +193,7 @@ fn spawn_window_title_generation(window_id: String, pane_titles: String) {
 }
 
 fn main() {
-    eprintln!("pane-title-daemon: starting");
+    eprintln!("tmux-ai-titles: starting");
 
     let mut pane_states: HashMap<String, PaneState> = HashMap::new();
     let mut window_states: HashMap<String, WindowState> = HashMap::new();

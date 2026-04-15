@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "pane-title-daemon"
+name = "tmux-ai-titles"
 version = "0.1.0"
