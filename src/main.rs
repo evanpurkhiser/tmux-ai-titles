@@ -280,6 +280,7 @@ fn get_pane_title(pane_id: &str) -> String {
 fn spawn_pane_title_generation(
     pane_id: String,
     buffer: String,
+    cwd: String,
     model: Arc<str>,
     set_title: bool,
     title_map: TitleMap,
@@ -326,7 +327,18 @@ fn spawn_pane_title_generation(
             None
         };
 
-        let input = format!("```\n{buffer}\n```");
+        let mut context = String::new();
+        if !current_title.is_empty() {
+            context.push_str(&format!("Previous title: {current_title}\n"));
+        }
+        if !cwd.is_empty() {
+            context.push_str(&format!("Working directory: {cwd}\n"));
+        }
+        let input = if context.is_empty() {
+            format!("```\n{buffer}\n```")
+        } else {
+            format!("{context}\n```\n{buffer}\n```")
+        };
         let title = call_claude(&model, PANE_TITLE_PROMPT, &input);
 
         // SpinnerGuard will set done=true on drop, but we also set it here so
@@ -557,6 +569,7 @@ fn cmd_start(args: StartArgs) {
                 spawn_pane_title_generation(
                     pane.pane_id.clone(),
                     buffer,
+                    pane.cwd.clone(),
                     model.clone(),
                     !args.no_pane_titles,
                     title_map.clone(),
