@@ -8,7 +8,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -482,27 +482,23 @@ fn cmd_start(args: StartArgs) {
     let in_flight: InFlight = Arc::new(Mutex::new(HashSet::new()));
     let model: Arc<str> = Arc::from(args.model.as_str());
 
-    // Set up signal handling
-    let should_stop = Arc::new(AtomicBool::new(false));
-    let should_regenerate = Arc::new(AtomicBool::new(false));
+    // Signal state: (should_stop, should_regenerate)
+    let signal_state = Arc::new((Mutex::new((false, false)), Condvar::new()));
 
     let mut signals = Signals::new([SIGTERM, SIGHUP]).expect("failed to register signal handlers");
 
     {
-        let should_stop = should_stop.clone();
-        let should_regenerate = should_regenerate.clone();
+        let signal_state = signal_state.clone();
         thread::spawn(move || {
             for sig in signals.forever() {
+                let (lock, cvar) = &*signal_state;
+                let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
                 match sig {
-                    SIGTERM => {
-                        should_stop.store(true, Ordering::Relaxed);
-                        break;
-                    }
-                    SIGHUP => {
-                        should_regenerate.store(true, Ordering::Relaxed);
-                    }
-                    _ => {}
+                    SIGTERM => state.0 = true,
+                    SIGHUP => state.1 = true,
+                    _ => continue,
                 }
+                cvar.notify_one();
             }
         });
     }
@@ -516,20 +512,25 @@ fn cmd_start(args: StartArgs) {
     let mut window_states: HashMap<String, ChangeTracker> = HashMap::new();
 
     loop {
-        if should_stop.load(Ordering::Relaxed) {
-            eprintln!("tmux-ai-titles: received SIGTERM, shutting down");
-            remove_pid_file();
-            break;
-        }
+        {
+            let (lock, _) = &*signal_state;
+            let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
 
-        // Handle SIGHUP: clear all has_generated flags
-        if should_regenerate.swap(false, Ordering::Relaxed) {
-            eprintln!("tmux-ai-titles: received SIGHUP, clearing generated flags");
-            for state in pane_states.values_mut() {
-                state.has_generated = false;
+            if state.0 {
+                eprintln!("tmux-ai-titles: received SIGTERM, shutting down");
+                remove_pid_file();
+                break;
             }
-            for state in window_states.values_mut() {
-                state.has_generated = false;
+
+            if state.1 {
+                eprintln!("tmux-ai-titles: received SIGHUP, clearing generated flags");
+                state.1 = false;
+                for s in pane_states.values_mut() {
+                    s.has_generated = false;
+                }
+                for s in window_states.values_mut() {
+                    s.has_generated = false;
+                }
             }
         }
 
@@ -662,7 +663,10 @@ fn cmd_start(args: StartArgs) {
             }
         }
 
-        thread::sleep(poll_interval);
+        // Wait for poll interval or until a signal wakes us
+        let (lock, cvar) = &*signal_state;
+        let state = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = cvar.wait_timeout(state, poll_interval);
     }
 }
 
