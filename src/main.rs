@@ -11,13 +11,12 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const SPINNER_INTERVAL: Duration = Duration::from_millis(80);
 const CAPTURE_LINES: usize = 500;
 
-const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠚", "⠞", "⠖", "⠦", "⠴", "⠲", "⠳", "⠓"];
 
 #[derive(Debug)]
 struct PaneState {
     history_size: usize,
     last_generated_at: usize,
-    generating: bool,
 }
 
 struct PaneInfo {
@@ -106,17 +105,34 @@ fn set_pane_title(pane_id: &str, title: &str) {
         .ok();
 }
 
+fn get_pane_title(pane_id: &str) -> String {
+    Command::new("tmux")
+        .args(["display-message", "-t", pane_id, "-p", "#{pane_title}"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
 fn spawn_title_generation(pane_id: String, buffer: String) {
     thread::spawn(move || {
         let done = Arc::new(AtomicBool::new(false));
         let done_clone = done.clone();
         let pane_id_clone = pane_id.clone();
 
+        // Get current title to preserve during loading
+        let current_title = get_pane_title(&pane_id);
+
         // Spinner thread
         let spinner = thread::spawn(move || {
             let mut frame = 0;
             while !done_clone.load(Ordering::Relaxed) {
-                set_pane_title(&pane_id_clone, SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]);
+                let spinner = SPINNER_FRAMES[frame % SPINNER_FRAMES.len()];
+                if current_title.is_empty() {
+                    set_pane_title(&pane_id_clone, spinner);
+                } else {
+                    set_pane_title(&pane_id_clone, &format!("{spinner} {current_title}"));
+                }
                 frame += 1;
                 thread::sleep(SPINNER_INTERVAL);
             }
@@ -129,7 +145,7 @@ fn spawn_title_generation(pane_id: String, buffer: String) {
 
         if let Some(title) = title {
             set_pane_title(&pane_id, &title);
-            eprintln!("pane-title-daemon: {} -> {:?}", pane_id, title);
+            eprintln!("{} -> {}", pane_id, title);
         }
     });
 }
@@ -147,28 +163,24 @@ fn main() {
         states.retain(|id, _| active_ids.contains(&id.as_str()));
 
         for pane in &panes {
+            let is_new = !states.contains_key(&pane.pane_id);
             let state = states.entry(pane.pane_id.clone()).or_insert(PaneState {
                 history_size: pane.history_size,
                 last_generated_at: pane.history_size,
-                generating: false,
             });
 
             state.history_size = pane.history_size;
             let lines_since = pane.history_size.saturating_sub(state.last_generated_at);
 
-            if lines_since >= LINE_THRESHOLD && !state.generating {
-                eprintln!(
-                    "pane-title-daemon: generating title for {} ({lines_since} new lines)",
-                    pane.pane_id
-                );
+            // Generate on first sight if pane has any content, then every 200 new lines
+            let should_generate = pane.history_size > 0
+                && (is_new || lines_since >= LINE_THRESHOLD);
 
+            if should_generate {
                 if let Some(buffer) = capture_pane(&pane.pane_id) {
-                    state.generating = true;
                     spawn_title_generation(pane.pane_id.clone(), buffer);
                 }
-
                 state.last_generated_at = pane.history_size;
-                state.generating = false;
             }
         }
 
