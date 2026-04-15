@@ -1,54 +1,50 @@
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const CLAUDE_PATH: &str = "/Users/evan/.local/bin/claude";
-const LINE_THRESHOLD: usize = 200;
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
+const REGEN_DELAY: Duration = Duration::from_secs(300);
 const SPINNER_INTERVAL: Duration = Duration::from_millis(80);
 const CAPTURE_LINES: usize = 500;
+const HASH_LINES: usize = 50;
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠚", "⠞", "⠖", "⠦", "⠴", "⠲", "⠳", "⠓"];
 
-#[derive(Debug)]
 struct PaneState {
-    history_size: usize,
-    last_generated_at: usize,
+    last_hash: u64,
+    last_changed: Instant,
+    last_generated: Instant,
+    has_generated: bool,
 }
 
-struct PaneInfo {
-    pane_id: String,
-    history_size: usize,
+fn hash_buffer(buffer: &str) -> u64 {
+    // Hash the last HASH_LINES lines
+    let lines: Vec<&str> = buffer.lines().rev().take(HASH_LINES).collect();
+    let mut hasher = DefaultHasher::new();
+    lines.hash(&mut hasher);
+    hasher.finish()
 }
 
-fn list_panes() -> Vec<PaneInfo> {
+fn list_pane_ids() -> Vec<String> {
     let output = Command::new("tmux")
-        .args(["list-panes", "-a", "-F", "#{pane_id} #{history_size}"])
+        .args(["list-panes", "-a", "-F", "#{pane_id}"])
         .output()
         .ok();
 
     let Some(output) = output else { return vec![] };
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    stdout
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.splitn(2, ' ');
-            let pane_id = parts.next()?.to_string();
-            let history_size: usize = parts.next()?.parse().ok()?;
-            Some(PaneInfo {
-                pane_id,
-                history_size,
-            })
-        })
-        .collect()
+    stdout.lines().map(|s| s.to_string()).collect()
 }
 
-fn capture_pane(pane_id: &str) -> Option<String> {
-    let start = -(CAPTURE_LINES as i64);
+fn capture_pane(pane_id: &str, lines: usize) -> Option<String> {
+    let start = -(lines as i64);
     let output = Command::new("tmux")
         .args([
             "capture-pane",
@@ -62,7 +58,13 @@ fn capture_pane(pane_id: &str) -> Option<String> {
         .ok()?;
 
     if output.status.success() {
-        Some(String::from_utf8_lossy(&output.stdout).to_string())
+        let content = String::from_utf8_lossy(&output.stdout).to_string();
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(content)
+        }
     } else {
         None
     }
@@ -156,31 +158,53 @@ fn main() {
     let mut states: HashMap<String, PaneState> = HashMap::new();
 
     loop {
-        let panes = list_panes();
+        let pane_ids = list_pane_ids();
 
         // Clean up state for panes that no longer exist
-        let active_ids: Vec<&str> = panes.iter().map(|p| p.pane_id.as_str()).collect();
-        states.retain(|id, _| active_ids.contains(&id.as_str()));
+        states.retain(|id, _| pane_ids.contains(id));
 
-        for pane in &panes {
-            let is_new = !states.contains_key(&pane.pane_id);
-            let state = states.entry(pane.pane_id.clone()).or_insert(PaneState {
-                history_size: pane.history_size,
-                last_generated_at: pane.history_size,
+        let now = Instant::now();
+
+        for pane_id in &pane_ids {
+            // Capture a small snippet for hashing
+            let Some(snippet) = capture_pane(pane_id, HASH_LINES) else {
+                continue;
+            };
+
+            let hash = hash_buffer(&snippet);
+            let is_new = !states.contains_key(pane_id);
+
+            let state = states.entry(pane_id.clone()).or_insert(PaneState {
+                last_hash: hash,
+                last_changed: now,
+                last_generated: now,
+                has_generated: false,
             });
 
-            state.history_size = pane.history_size;
-            let lines_since = pane.history_size.saturating_sub(state.last_generated_at);
+            // Update last_changed if content changed
+            if hash != state.last_hash {
+                state.last_changed = now;
+                state.last_hash = hash;
+            }
 
-            // Generate on first sight if pane has any content, then every 200 new lines
-            let should_generate = pane.history_size > 0
-                && (is_new || lines_since >= LINE_THRESHOLD);
+            // Generate on first sight, or when content has been stable
+            // for REGEN_DELAY after changing since last generation
+            let should_generate = if is_new {
+                true
+            } else if !state.has_generated {
+                true
+            } else {
+                state.last_changed > state.last_generated
+                    && now.duration_since(state.last_changed) >= REGEN_DELAY
+            };
 
             if should_generate {
-                if let Some(buffer) = capture_pane(&pane.pane_id) {
-                    spawn_title_generation(pane.pane_id.clone(), buffer);
+                // Capture full buffer for title generation
+                if let Some(buffer) = capture_pane(pane_id, CAPTURE_LINES) {
+                    spawn_title_generation(pane_id.clone(), buffer);
                 }
-                state.last_generated_at = pane.history_size;
+                state.last_generated = now;
+                state.has_generated = true;
             }
         }
 
