@@ -25,6 +25,13 @@ A braille spinner animation is shown in the pane border while titles are being g
 brew install evanpurkhiser/personal/tmux-ai-titles
 ```
 
+### AUR (Arch Linux)
+
+```bash
+yay -S tmux-ai-titles     # build from source
+yay -S tmux-ai-titles-bin # prebuilt binary
+```
+
 ### Cargo
 
 ```bash
