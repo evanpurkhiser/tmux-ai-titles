@@ -18,7 +18,9 @@ const PANE_TITLE_PROMPT: &str = "\
 Generate a 4-5 word title for a tmux pane. Focus on the specific task or activity \
 visible in the output — e.g. \"Editing Rust build config\" not \"Terminal Session\". \
 Use the working directory and previous title for context when the output alone is ambiguous. \
-For empty or idle shells, use \"Idle\" followed by the directory basename. \
+If the terminal just shows a shell prompt with no meaningful recent output, title it \
+based on the working directory — e.g. \"Shell in tmux-ai-titles\". Never use words like \
+\"idle\", \"awaiting\", or \"waiting\" in the title. \
 Output ONLY the title. No quotes, no punctuation, no explanation.";
 
 const WINDOW_TITLE_PROMPT: &str = "\
