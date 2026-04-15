@@ -28,8 +28,7 @@ brew install evanpurkhiser/personal/tmux-ai-titles
 ### AUR (Arch Linux)
 
 ```bash
-yay -S tmux-ai-titles     # build from source
-yay -S tmux-ai-titles-bin # prebuilt binary
+yay -S tmux-ai-titles
 ```
 
 ### Cargo
