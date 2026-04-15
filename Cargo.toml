@@ -1,7 +1,15 @@
 [package]
 name = "tmux-ai-titles"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
+description = "AI-powered title generation for tmux panes and windows"
+license = "MIT"
+repository = "https://github.com/evanpurkhiser/tmux-ai-titles"
+homepage = "https://github.com/evanpurkhiser/tmux-ai-titles"
+readme = "README.md"
+keywords = ["cli", "tmux", "ai"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+signal-hook = "0.3"

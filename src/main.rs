@@ -1,7 +1,11 @@
-use clap::Parser;
+use clap::{Parser, Subcommand};
+use signal_hook::consts::{SIGHUP, SIGTERM};
+use signal_hook::iterator::Signals;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+use std::io::Write;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -17,7 +21,25 @@ const WINDOW_TITLE_PROMPT: &str = "You are given a list of short pane titles fro
 /// AI-powered title generation for tmux panes and windows
 #[derive(Parser)]
 #[command(version)]
-struct Args {
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Start the title generation daemon
+    Start(StartArgs),
+    /// Stop the running daemon
+    Stop,
+    /// Regenerate all titles on the next cycle
+    Regenerate,
+    /// Check if the daemon is running
+    Status,
+}
+
+#[derive(Parser)]
+struct StartArgs {
     /// Seconds to wait after content changes before regenerating
     #[arg(long, default_value_t = 300)]
     regenerate_delay: u64,
@@ -45,6 +67,41 @@ struct Args {
     /// Disable window title generation
     #[arg(long)]
     no_window_titles: bool,
+}
+
+fn pid_file_path() -> PathBuf {
+    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+        PathBuf::from(dir).join("tmux-ai-titles.pid")
+    } else {
+        PathBuf::from("/tmp/tmux-ai-titles.pid")
+    }
+}
+
+fn read_pid() -> Option<u32> {
+    let path = pid_file_path();
+    let contents = std::fs::read_to_string(&path).ok()?;
+    contents.trim().parse().ok()
+}
+
+fn process_is_running(pid: u32) -> bool {
+    // kill -0 checks if process exists without actually sending a signal
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+fn write_pid_file() {
+    let path = pid_file_path();
+    if let Ok(mut file) = std::fs::File::create(&path) {
+        let _ = write!(file, "{}", std::process::id());
+    }
+}
+
+fn remove_pid_file() {
+    let _ = std::fs::remove_file(pid_file_path());
 }
 
 /// Tracks content changes and generation timing for both panes and windows.
@@ -90,6 +147,7 @@ impl ChangeTracker {
 struct PaneInfo {
     pane_id: String,
     window_id: String,
+    cwd: String,
 }
 
 /// Shared map of pane_id -> generated title, used for window title generation
@@ -125,7 +183,7 @@ fn hash_buffer(buffer: &str, hash_lines: usize) -> u64 {
 
 fn list_panes() -> Vec<PaneInfo> {
     let output = Command::new("tmux")
-        .args(["list-panes", "-a", "-F", "#{pane_id} #{window_id}"])
+        .args(["list-panes", "-a", "-F", "#{pane_id} #{window_id} #{pane_current_path}"])
         .output()
         .ok();
 
@@ -135,10 +193,11 @@ fn list_panes() -> Vec<PaneInfo> {
     stdout
         .lines()
         .filter_map(|line| {
-            let mut parts = line.splitn(2, ' ');
+            let mut parts = line.splitn(3, ' ');
             let pane_id = parts.next()?.to_string();
             let window_id = parts.next()?.to_string();
-            Some(PaneInfo { pane_id, window_id })
+            let cwd = parts.next().unwrap_or("").to_string();
+            Some(PaneInfo { pane_id, window_id, cwd })
         })
         .collect()
 }
@@ -179,7 +238,6 @@ fn call_claude(model: &str, prompt: &str, input: &str) -> Option<String> {
         .spawn()
         .ok()?;
 
-    use std::io::Write;
     if let Some(stdin) = child.stdin.as_mut() {
         stdin.write_all(input.as_bytes()).ok();
     }
@@ -317,8 +375,84 @@ fn spawn_window_title_generation(
     });
 }
 
-fn main() {
-    let args = Args::parse();
+fn cmd_stop() {
+    let Some(pid) = read_pid() else {
+        eprintln!("tmux-ai-titles: no PID file found, daemon is not running");
+        std::process::exit(1);
+    };
+
+    if !process_is_running(pid) {
+        eprintln!("tmux-ai-titles: stale PID file (process {} not running), cleaning up", pid);
+        remove_pid_file();
+        std::process::exit(1);
+    }
+
+    // Send SIGTERM
+    let status = Command::new("kill")
+        .args([&pid.to_string()])
+        .status();
+
+    match status {
+        Ok(s) if s.success() => eprintln!("tmux-ai-titles: sent SIGTERM to process {}", pid),
+        _ => {
+            eprintln!("tmux-ai-titles: failed to send SIGTERM to process {}", pid);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_regenerate() {
+    let Some(pid) = read_pid() else {
+        eprintln!("tmux-ai-titles: no PID file found, daemon is not running");
+        std::process::exit(1);
+    };
+
+    if !process_is_running(pid) {
+        eprintln!("tmux-ai-titles: stale PID file (process {} not running), cleaning up", pid);
+        remove_pid_file();
+        std::process::exit(1);
+    }
+
+    let status = Command::new("kill")
+        .args(["-HUP", &pid.to_string()])
+        .status();
+
+    match status {
+        Ok(s) if s.success() => eprintln!("tmux-ai-titles: sent SIGHUP to process {} (will regenerate all titles)", pid),
+        _ => {
+            eprintln!("tmux-ai-titles: failed to send SIGHUP to process {}", pid);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_status() {
+    let Some(pid) = read_pid() else {
+        println!("tmux-ai-titles: not running (no PID file)");
+        std::process::exit(1);
+    };
+
+    if process_is_running(pid) {
+        println!("tmux-ai-titles: running (PID {})", pid);
+    } else {
+        println!("tmux-ai-titles: not running (stale PID file for process {})", pid);
+        remove_pid_file();
+        std::process::exit(1);
+    }
+}
+
+fn cmd_start(args: StartArgs) {
+    // Check if already running
+    if let Some(pid) = read_pid() {
+        if process_is_running(pid) {
+            eprintln!("tmux-ai-titles: already running (PID {})", pid);
+            std::process::exit(1);
+        }
+        // Stale PID file, clean up
+        remove_pid_file();
+    }
+
+    write_pid_file();
 
     let regen_delay = Duration::from_secs(args.regenerate_delay);
     let poll_interval = Duration::from_secs(args.poll_interval);
@@ -326,15 +460,57 @@ fn main() {
     let in_flight: InFlight = Arc::new(Mutex::new(HashSet::new()));
     let model: Arc<str> = Arc::from(args.model.as_str());
 
+    // Set up signal handling
+    let should_stop = Arc::new(AtomicBool::new(false));
+    let should_regenerate = Arc::new(AtomicBool::new(false));
+
+    let mut signals = Signals::new([SIGTERM, SIGHUP]).expect("failed to register signal handlers");
+
+    {
+        let should_stop = should_stop.clone();
+        let should_regenerate = should_regenerate.clone();
+        thread::spawn(move || {
+            for sig in signals.forever() {
+                match sig {
+                    SIGTERM => {
+                        should_stop.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    SIGHUP => {
+                        should_regenerate.store(true, Ordering::Relaxed);
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+
     eprintln!(
-        "tmux-ai-titles: starting (model={}, poll={}s, regen_delay={}s, capture={}, hash={})",
-        model, args.poll_interval, args.regenerate_delay, args.capture_lines, args.hash_lines
+        "tmux-ai-titles: starting (pid={}, model={}, poll={}s, regen_delay={}s, capture={}, hash={})",
+        std::process::id(), model, args.poll_interval, args.regenerate_delay, args.capture_lines, args.hash_lines
     );
 
     let mut pane_states: HashMap<String, ChangeTracker> = HashMap::new();
     let mut window_states: HashMap<String, ChangeTracker> = HashMap::new();
 
     loop {
+        if should_stop.load(Ordering::Relaxed) {
+            eprintln!("tmux-ai-titles: received SIGTERM, shutting down");
+            remove_pid_file();
+            break;
+        }
+
+        // Handle SIGHUP: clear all has_generated flags
+        if should_regenerate.swap(false, Ordering::Relaxed) {
+            eprintln!("tmux-ai-titles: received SIGHUP, clearing generated flags");
+            for state in pane_states.values_mut() {
+                state.has_generated = false;
+            }
+            for state in window_states.values_mut() {
+                state.has_generated = false;
+            }
+        }
+
         let panes = list_panes();
 
         let active_pane_ids: HashSet<&str> = panes.iter().map(|p| p.pane_id.as_str()).collect();
@@ -392,7 +568,7 @@ fn main() {
 
         // --- Window titles ---
         if !args.no_window_titles {
-            let mut window_panes: HashMap<&str, Vec<(String, bool)>> = HashMap::new();
+            let mut window_panes: HashMap<&str, Vec<(String, String, bool)>> = HashMap::new();
             let titles_snapshot = title_map.lock().unwrap_or_else(|e| e.into_inner());
             let in_flight_snapshot = in_flight.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -408,13 +584,13 @@ fn main() {
                 window_panes
                     .entry(pane.window_id.as_str())
                     .or_default()
-                    .push((title, pane_in_flight));
+                    .push((title, pane.cwd.clone(), pane_in_flight));
             }
             drop(titles_snapshot);
             drop(in_flight_snapshot);
 
             for (window_id, titles) in &window_panes {
-                let combined: String = titles.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>().join(", ");
+                let combined: String = titles.iter().map(|(t, c, _)| format!("{t} {c}")).collect::<Vec<_>>().join(", ");
                 let hash = hash_str(&combined);
 
                 let state = window_states
@@ -425,10 +601,10 @@ fn main() {
 
                 if state.should_generate(now, regen_delay) {
                     // Skip panes that are currently generating titles
-                    let real_titles: Vec<&str> = titles
+                    let real_titles: Vec<(&str, &str)> = titles
                         .iter()
-                        .filter(|(t, pane_in_flight)| !t.is_empty() && !pane_in_flight)
-                        .map(|(t, _)| t.as_str())
+                        .filter(|(t, _, in_flight)| !t.is_empty() && !in_flight)
+                        .map(|(t, c, _)| (t.as_str(), c.as_str()))
                         .collect();
 
                     if real_titles.is_empty() {
@@ -448,14 +624,9 @@ fn main() {
                     let input = real_titles
                         .iter()
                         .enumerate()
-                        .map(|(i, t)| format!("{}. {}", i + 1, t))
+                        .map(|(i, (t, c))| format!("{}. {} (cwd: {})", i + 1, t, c))
                         .collect::<Vec<_>>()
                         .join("\n");
-
-                    in_flight
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(window_id.to_string());
 
                     spawn_window_title_generation(
                         window_id.to_string(),
@@ -469,5 +640,16 @@ fn main() {
         }
 
         thread::sleep(poll_interval);
+    }
+}
+
+fn main() {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Start(args) => cmd_start(args),
+        Commands::Stop => cmd_stop(),
+        Commands::Regenerate => cmd_regenerate(),
+        Commands::Status => cmd_status(),
     }
 }
