@@ -86,7 +86,8 @@ All options are passed to the `start` subcommand:
 |---|---|---|
 | `--poll-interval` | 5 | How often to poll panes for changes (seconds) |
 | `--regenerate-delay` | 300 | Seconds after content change before regenerating |
-| `--capture-lines` | 500 | Lines of buffer to send for pane title generation |
+| `--capture-lines` | 250 | Lines of buffer to send for pane title generation |
+| `--foreground` | | Run in foreground (skip PID file check) |
 | `--hash-lines` | 50 | Lines of buffer to hash for change detection |
 | `--model` | haiku | Claude model to use |
 | `--no-pane-titles` | | Disable pane title generation (window titles still work) |

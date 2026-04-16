@@ -57,7 +57,7 @@ struct StartArgs {
     regenerate_delay: u64,
 
     /// Lines of buffer to capture for title generation
-    #[arg(long, default_value_t = 500)]
+    #[arg(long, default_value_t = 250)]
     capture_lines: usize,
 
     /// Lines of buffer to hash for change detection
@@ -79,6 +79,10 @@ struct StartArgs {
     /// Disable window title generation
     #[arg(long)]
     no_window_titles: bool,
+
+    /// Run in the foreground (don't check PID file)
+    #[arg(long)]
+    foreground: bool,
 }
 
 fn pid_file_path() -> PathBuf {
@@ -352,6 +356,8 @@ fn spawn_pane_title_generation(
                 .unwrap_or_default()
         };
 
+
+
         // Only show spinner if we're setting pane titles
         let spinner = if set_title {
             let done_clone = done.clone();
@@ -501,17 +507,19 @@ fn cmd_status() {
 }
 
 fn cmd_start(args: StartArgs) {
-    // Check if already running
-    if let Some(pid) = read_pid() {
-        if process_is_running(pid) {
-            eprintln!("tmux-ai-titles: already running (PID {})", pid);
-            std::process::exit(1);
+    if !args.foreground {
+        // Check if already running
+        if let Some(pid) = read_pid() {
+            if process_is_running(pid) {
+                eprintln!("tmux-ai-titles: already running (PID {})", pid);
+                std::process::exit(1);
+            }
+            // Stale PID file, clean up
+            remove_pid_file();
         }
-        // Stale PID file, clean up
-        remove_pid_file();
-    }
 
-    write_pid_file();
+        write_pid_file();
+    }
 
     let regen_delay = Duration::from_secs(args.regenerate_delay);
     let poll_interval = Duration::from_secs(args.poll_interval);
