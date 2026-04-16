@@ -234,7 +234,12 @@ fn hash_buffer(buffer: &str, hash_lines: usize) -> u64 {
 
 fn list_panes() -> Vec<PaneInfo> {
     let output = Command::new("tmux")
-        .args(["list-panes", "-a", "-F", "#{pane_id} #{window_id} #{pane_current_path}"])
+        .args([
+            "list-panes",
+            "-a",
+            "-F",
+            "#{pane_id} #{window_id} #{pane_current_path}",
+        ])
         .output()
         .ok();
 
@@ -248,7 +253,11 @@ fn list_panes() -> Vec<PaneInfo> {
             let pane_id = parts.next()?.to_string();
             let window_id = parts.next()?.to_string();
             let cwd = parts.next().unwrap_or("").to_string();
-            Some(PaneInfo { pane_id, window_id, cwd })
+            Some(PaneInfo {
+                pane_id,
+                window_id,
+                cwd,
+            })
         })
         .collect()
 }
@@ -356,8 +365,6 @@ fn spawn_pane_title_generation(
                 .unwrap_or_default()
         };
 
-
-
         // Only show spinner if we're setting pane titles
         let spinner = if set_title {
             let done_clone = done.clone();
@@ -382,7 +389,9 @@ fn spawn_pane_title_generation(
 
         let mut context = String::new();
         if !current_title.is_empty() {
-            context.push_str(&format!("Previous title: {current_title}\n"));
+            context.push_str(&format!(
+                "Previous title (for context only, may be outdated): {current_title}\n"
+            ));
         }
         if !cwd.is_empty() {
             context.push_str(&format!("Working directory: {cwd}\n"));
@@ -447,15 +456,16 @@ fn cmd_stop() {
     };
 
     if !process_is_running(pid) {
-        eprintln!("tmux-ai-titles: stale PID file (process {} not running), cleaning up", pid);
+        eprintln!(
+            "tmux-ai-titles: stale PID file (process {} not running), cleaning up",
+            pid
+        );
         remove_pid_file();
         std::process::exit(1);
     }
 
     // Send SIGTERM
-    let status = Command::new("kill")
-        .args([&pid.to_string()])
-        .status();
+    let status = Command::new("kill").args([&pid.to_string()]).status();
 
     match status {
         Ok(s) if s.success() => eprintln!("tmux-ai-titles: sent SIGTERM to process {}", pid),
@@ -473,7 +483,10 @@ fn cmd_regenerate() {
     };
 
     if !process_is_running(pid) {
-        eprintln!("tmux-ai-titles: stale PID file (process {} not running), cleaning up", pid);
+        eprintln!(
+            "tmux-ai-titles: stale PID file (process {} not running), cleaning up",
+            pid
+        );
         remove_pid_file();
         std::process::exit(1);
     }
@@ -483,7 +496,10 @@ fn cmd_regenerate() {
         .status();
 
     match status {
-        Ok(s) if s.success() => eprintln!("tmux-ai-titles: sent SIGHUP to process {} (will regenerate all titles)", pid),
+        Ok(s) if s.success() => eprintln!(
+            "tmux-ai-titles: sent SIGHUP to process {} (will regenerate all titles)",
+            pid
+        ),
         _ => {
             eprintln!("tmux-ai-titles: failed to send SIGHUP to process {}", pid);
             std::process::exit(1);
@@ -500,7 +516,10 @@ fn cmd_status() {
     if process_is_running(pid) {
         println!("tmux-ai-titles: running (PID {})", pid);
     } else {
-        println!("tmux-ai-titles: not running (stale PID file for process {})", pid);
+        println!(
+            "tmux-ai-titles: not running (stale PID file for process {})",
+            pid
+        );
         remove_pid_file();
         std::process::exit(1);
     }
@@ -549,7 +568,12 @@ fn cmd_start(args: StartArgs) {
 
     eprintln!(
         "tmux-ai-titles: starting (pid={}, model={}, poll={}s, regen_delay={}s, capture={}, hash={})",
-        std::process::id(), model, args.poll_interval, args.regenerate_delay, args.capture_lines, args.hash_lines
+        std::process::id(),
+        model,
+        args.poll_interval,
+        args.regenerate_delay,
+        args.capture_lines,
+        args.hash_lines
     );
 
     let mut pane_states: HashMap<String, ChangeTracker> = HashMap::new();
@@ -657,7 +681,11 @@ fn cmd_start(args: StartArgs) {
             drop(in_flight_snapshot);
 
             for (window_id, titles) in &window_panes {
-                let combined: String = titles.iter().map(|(t, c, _)| format!("{t} {c}")).collect::<Vec<_>>().join(", ");
+                let combined: String = titles
+                    .iter()
+                    .map(|(t, c, _)| format!("{t} {c}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 let hash = hash_str(&combined);
 
                 let state = window_states
