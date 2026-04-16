@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -236,9 +237,6 @@ struct PaneInfo {
 /// Shared map of pane_id -> generated title, used for window title generation
 type TitleMap = Arc<Mutex<HashMap<String, String>>>;
 
-/// Set of pane/window IDs currently being processed by a background thread
-type InFlight = Arc<Mutex<HashSet<String>>>;
-
 /// Pending regeneration scope. All subsumes Specific — if both are requested
 /// before the main loop consumes the request, All wins.
 enum RegenerateScope {
@@ -445,7 +443,7 @@ fn spawn_pane_title_generation(
     model: Arc<str>,
     set_title: bool,
     title_map: TitleMap,
-    in_flight: InFlight,
+    done_tx: mpsc::Sender<String>,
 ) {
     thread::spawn(move || {
         // Relaxed ordering is sufficient here: the spinner thread and the
@@ -526,7 +524,7 @@ fn spawn_pane_title_generation(
             eprintln!("pane {} -> {}", pane_id, title);
         }
 
-        in_flight.lock().unwrap().remove(&pane_id);
+        done_tx.send(pane_id).ok();
     });
 }
 
@@ -534,7 +532,7 @@ fn spawn_window_title_generation(
     window_id: String,
     pane_titles: String,
     model: Arc<str>,
-    in_flight: InFlight,
+    done_tx: mpsc::Sender<String>,
 ) {
     thread::spawn(move || {
         let title = call_claude(&model, WINDOW_TITLE_PROMPT, &pane_titles);
@@ -543,7 +541,7 @@ fn spawn_window_title_generation(
             eprintln!("window {} -> {}", window_id, title);
         }
 
-        in_flight.lock().unwrap().remove(&window_id);
+        done_tx.send(window_id).ok();
     });
 }
 
@@ -653,7 +651,8 @@ fn cmd_start(args: StartArgs) {
     let regen_delay = Duration::from_secs(args.regenerate_delay);
     let poll_interval = Duration::from_secs(args.poll_interval);
     let title_map: TitleMap = Arc::new(Mutex::new(HashMap::new()));
-    let in_flight: InFlight = Arc::new(Mutex::new(HashSet::new()));
+    let mut in_flight: HashSet<String> = HashSet::new();
+    let (done_tx, done_rx) = mpsc::channel::<String>();
     let model: Arc<str> = Arc::from(args.model.as_str());
 
     let notifier = Arc::new(CommandNotifier::new());
@@ -688,6 +687,11 @@ fn cmd_start(args: StartArgs) {
     let mut window_states: HashMap<String, ChangeTracker> = HashMap::new();
 
     loop {
+        // Reap completed workers before deciding what to spawn this cycle.
+        while let Ok(id) = done_rx.try_recv() {
+            in_flight.remove(&id);
+        }
+
         let regenerate_scope = {
             let mut state = notifier.lock();
 
@@ -763,13 +767,7 @@ fn cmd_start(args: StartArgs) {
             state.update_hash(hash, now);
 
             if state.should_generate(now, regen_delay) {
-                // Atomically check-and-insert to avoid TOCTOU
-                let was_inserted = in_flight
-                    .lock()
-                    .unwrap()
-                    .insert(pane.pane_id.clone());
-
-                if !was_inserted {
+                if !in_flight.insert(pane.pane_id.clone()) {
                     continue;
                 }
 
@@ -781,7 +779,7 @@ fn cmd_start(args: StartArgs) {
                     model.clone(),
                     !args.no_pane_titles,
                     title_map.clone(),
-                    in_flight.clone(),
+                    done_tx.clone(),
                 );
                 state.mark_generated(now);
             }
@@ -791,10 +789,9 @@ fn cmd_start(args: StartArgs) {
         if !args.no_window_titles {
             let mut window_panes: HashMap<&str, Vec<(String, String, bool)>> = HashMap::new();
             let titles_snapshot = title_map.lock().unwrap();
-            let in_flight_snapshot = in_flight.lock().unwrap();
 
             for pane in &panes {
-                let pane_in_flight = in_flight_snapshot.contains(&pane.pane_id);
+                let pane_in_flight = in_flight.contains(&pane.pane_id);
 
                 // Prefer our internal map, fall back to tmux pane title
                 let title = titles_snapshot
@@ -808,7 +805,6 @@ fn cmd_start(args: StartArgs) {
                     .push((title, pane.cwd.clone(), pane_in_flight));
             }
             drop(titles_snapshot);
-            drop(in_flight_snapshot);
 
             for (window_id, titles) in &window_panes {
                 let combined: String = titles
@@ -836,13 +832,7 @@ fn cmd_start(args: StartArgs) {
                         continue;
                     }
 
-                    // Atomically check-and-insert to avoid TOCTOU
-                    let was_inserted = in_flight
-                        .lock()
-                        .unwrap()
-                        .insert(window_id.to_string());
-
-                    if !was_inserted {
+                    if !in_flight.insert(window_id.to_string()) {
                         continue;
                     }
 
@@ -857,7 +847,7 @@ fn cmd_start(args: StartArgs) {
                         window_id.to_string(),
                         input,
                         model.clone(),
-                        in_flight.clone(),
+                        done_tx.clone(),
                     );
                     state.mark_generated(now);
                 }
