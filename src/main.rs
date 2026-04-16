@@ -164,6 +164,7 @@ struct PaneInfo {
     pane_id: String,
     window_id: String,
     cwd: String,
+    command: String,
 }
 
 /// Shared map of pane_id -> generated title, used for window title generation
@@ -238,7 +239,7 @@ fn list_panes() -> Vec<PaneInfo> {
             "list-panes",
             "-a",
             "-F",
-            "#{pane_id} #{window_id} #{pane_current_path}",
+            "#{pane_id}\t#{window_id}\t#{pane_current_command}\t#{pane_current_path}",
         ])
         .output()
         .ok();
@@ -249,14 +250,16 @@ fn list_panes() -> Vec<PaneInfo> {
     stdout
         .lines()
         .filter_map(|line| {
-            let mut parts = line.splitn(3, ' ');
+            let mut parts = line.splitn(4, '\t');
             let pane_id = parts.next()?.to_string();
             let window_id = parts.next()?.to_string();
+            let command = parts.next().unwrap_or("").to_string();
             let cwd = parts.next().unwrap_or("").to_string();
             Some(PaneInfo {
                 pane_id,
                 window_id,
                 cwd,
+                command,
             })
         })
         .collect()
@@ -341,6 +344,7 @@ fn spawn_pane_title_generation(
     pane_id: String,
     buffer: String,
     cwd: String,
+    command: String,
     model: Arc<str>,
     set_title: bool,
     title_map: TitleMap,
@@ -392,6 +396,9 @@ fn spawn_pane_title_generation(
             context.push_str(&format!(
                 "Previous title (for context only, may be outdated): {current_title}\n"
             ));
+        }
+        if !command.is_empty() {
+            context.push_str(&format!("Running command: {command}\n"));
         }
         if !cwd.is_empty() {
             context.push_str(&format!("Working directory: {cwd}\n"));
@@ -648,6 +655,7 @@ fn cmd_start(args: StartArgs) {
                     pane.pane_id.clone(),
                     buffer,
                     pane.cwd.clone(),
+                    pane.command.clone(),
                     model.clone(),
                     !args.no_pane_titles,
                     title_map.clone(),
