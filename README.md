@@ -1,5 +1,7 @@
 # tmux-ai-titles
 
+[![Build](https://github.com/evanpurkhiser/tmux-ai-titles/actions/workflows/main.yml/badge.svg)](https://github.com/evanpurkhiser/tmux-ai-titles/actions/workflows/main.yml)
+
 A lightweight daemon that automatically generates descriptive titles for tmux panes and windows using AI.
 
 ## How it works
