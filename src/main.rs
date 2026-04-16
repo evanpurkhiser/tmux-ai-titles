@@ -207,7 +207,10 @@ impl SignalNotifier {
 
     fn wait_timeout(&self, timeout: Duration) {
         let state = self.lock();
-        let _ = self.cvar.wait_timeout(state, timeout);
+        // Only sleep if no signal is pending — otherwise the notify already fired
+        if !state.should_stop && !state.should_regenerate {
+            let _ = self.cvar.wait_timeout(state, timeout);
+        }
     }
 }
 
