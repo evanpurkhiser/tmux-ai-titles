@@ -80,7 +80,7 @@ set -g pane-border-format "#{pane_id} #{pane_title}"
 set -g allow-set-title off
 
 # Start the daemon when tmux launches
-run-shell "tmux-ai-titles start &"
+run-shell "tmux-ai-titles start"
 ```
 
 ## Options
