@@ -16,12 +16,14 @@ const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠚", "⠞", "⠖", "⠦", "⠴
 
 const PANE_TITLE_PROMPT: &str = "\
 Generate a 4-5 word title for a tmux pane based on the terminal output, running command, \
-and working directory provided below. Focus on the SPECIFIC task visible in the output. \
-Always prioritize the terminal output content over the working directory when generating \
-the title. Only fall back to the directory name if the output is truly empty. \
-The output may contain TUI formatting (unicode symbols like symbols, box-drawing characters, \
-ANSI codes) from tools like Claude Code, vim, or other terminal applications — look past \
-the formatting to understand what task is being performed. \
+and working directory provided below. The title should describe the most recent overarching \
+task or activity. Weight the END of the output most heavily — that is the most recent \
+activity. Earlier history may contain unrelated commands; ignore those unless they fit \
+the current theme. Always prioritize terminal output content over the working directory. \
+Only fall back to the directory name if the output is truly empty. \
+The output may contain TUI formatting (unicode symbols, box-drawing characters) from tools \
+like Claude Code, vim, or other terminal apps — look past the formatting to understand \
+the task being performed. \
 Never use generic titles like \"Shell in X\" when there is meaningful output to describe. \
 Never use words like \"idle\", \"awaiting\", or \"waiting\". \
 Output ONLY the 4-5 word title. No quotes, no punctuation, no explanation.";
