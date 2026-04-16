@@ -4,6 +4,7 @@ use signal_hook::iterator::Signals;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Write};
 use std::net::Shutdown;
@@ -487,15 +488,16 @@ fn spawn_pane_title_generation(
 
         let mut context = String::new();
         if !current_title.is_empty() {
-            context.push_str(&format!(
-                "Previous title (for context only, may be outdated): {current_title}\n"
-            ));
+            let _ = writeln!(
+                context,
+                "Previous title (for context only, may be outdated): {current_title}"
+            );
         }
         if !command.is_empty() {
-            context.push_str(&format!("Running command: {command}\n"));
+            let _ = writeln!(context, "Running command: {command}");
         }
         if !cwd.is_empty() {
-            context.push_str(&format!("Working directory: {cwd}\n"));
+            let _ = writeln!(context, "Working directory: {cwd}");
         }
         let input = if context.is_empty() {
             format!("```\n{buffer}\n```")
