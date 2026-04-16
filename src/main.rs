@@ -1,12 +1,16 @@
 use clap::{Parser, Subcommand};
-use signal_hook::consts::{SIGHUP, SIGTERM};
+use signal_hook::consts::SIGTERM;
 use signal_hook::iterator::Signals;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::io::Write;
-use std::path::PathBuf;
+use std::io::{BufRead, BufReader, Write};
+use std::net::Shutdown;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -49,8 +53,11 @@ enum Commands {
     Start(StartArgs),
     /// Stop the running daemon
     Stop,
-    /// Regenerate all titles on the next cycle
-    Regenerate,
+    /// Regenerate titles on the next cycle
+    Regenerate {
+        /// Pane (%N) or window (@N) IDs to regenerate. Omit to regenerate all.
+        targets: Vec<String>,
+    },
     /// Check if the daemon is running
     Status,
 }
@@ -85,44 +92,98 @@ struct StartArgs {
     #[arg(long)]
     no_window_titles: bool,
 
-    /// Run in the foreground (don't check PID file)
+    /// Stay in the foreground instead of forking to the background
     #[arg(long)]
-    foreground: bool,
+    no_bg: bool,
 }
 
-fn pid_file_path() -> PathBuf {
+fn socket_path() -> PathBuf {
     if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-        PathBuf::from(dir).join("tmux-ai-titles.pid")
+        PathBuf::from(dir).join("tmux-ai-titles.sock")
     } else {
-        PathBuf::from("/tmp/tmux-ai-titles.pid")
+        PathBuf::from("/tmp/tmux-ai-titles.sock")
     }
 }
 
-fn read_pid() -> Option<u32> {
-    let path = pid_file_path();
-    let contents = std::fs::read_to_string(&path).ok()?;
-    contents.trim().parse().ok()
+/// Wire protocol messages exchanged over the control socket. The daemon
+/// receives these; the client encodes them.
+enum Request {
+    Stop,
+    Regenerate(Vec<String>),
+    Status,
 }
 
-fn process_is_running(pid: u32) -> bool {
-    // kill -0 checks if process exists without actually sending a signal
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+enum ParseError {
+    Empty,
+    Unknown(String),
 }
 
-fn write_pid_file() {
-    let path = pid_file_path();
-    if let Ok(mut file) = std::fs::File::create(&path) {
-        let _ = write!(file, "{}", std::process::id());
+impl FromStr for Request {
+    type Err = ParseError;
+
+    fn from_str(line: &str) -> Result<Self, ParseError> {
+        let mut parts = line.split_whitespace();
+        let cmd = parts.next().ok_or(ParseError::Empty)?;
+        match cmd {
+            "stop" => Ok(Request::Stop),
+            "status" => Ok(Request::Status),
+            "regenerate" => Ok(Request::Regenerate(parts.map(str::to_string).collect())),
+            other => Err(ParseError::Unknown(other.to_string())),
+        }
     }
 }
 
-fn remove_pid_file() {
-    let _ = std::fs::remove_file(pid_file_path());
+impl fmt::Display for Request {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Request::Stop => f.write_str("stop"),
+            Request::Status => f.write_str("status"),
+            Request::Regenerate(targets) if targets.is_empty() => f.write_str("regenerate"),
+            Request::Regenerate(targets) => write!(f, "regenerate {}", targets.join(" ")),
+        }
+    }
+}
+
+/// Fork into the background and detach from the controlling terminal. Returns
+/// in the child; the parent exits inside `fork::daemon`. Must be called
+/// before any threads are spawned — fork() with live threads is UB.
+///
+/// Args are `nochdir=true` (stay in cwd) and `noclose=true` (inherit stdio so
+/// shell redirections like `start 2>log` keep working).
+fn daemonize() {
+    if let Err(errno) = fork::daemon(true, true) {
+        eprintln!("tmux-ai-titles: failed to daemonize (errno {errno})");
+        std::process::exit(1);
+    }
+}
+
+/// Bind the control socket. If the path exists, probe whether another daemon
+/// is listening; unlink and retry only if nothing answers.
+fn bind_socket(path: &Path) -> std::io::Result<UnixListener> {
+    match UnixListener::bind(path) {
+        Ok(listener) => Ok(listener),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            if UnixStream::connect(path).is_ok() {
+                Err(e)
+            } else {
+                std::fs::remove_file(path)?;
+                UnixListener::bind(path)
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Send a request to the daemon and return its response line.
+fn send_request(req: &Request) -> std::io::Result<String> {
+    let mut stream = UnixStream::connect(socket_path())?;
+    stream.write_all(req.to_string().as_bytes())?;
+    stream.write_all(b"\n")?;
+    stream.shutdown(Shutdown::Write)?;
+    let mut reader = BufReader::new(stream);
+    let mut resp = String::new();
+    reader.read_line(&mut resp)?;
+    Ok(resp.trim().to_string())
 }
 
 /// Tracks content changes and generation timing for both panes and windows.
@@ -178,28 +239,35 @@ type TitleMap = Arc<Mutex<HashMap<String, String>>>;
 /// Set of pane/window IDs currently being processed by a background thread
 type InFlight = Arc<Mutex<HashSet<String>>>;
 
-struct SignalState {
-    should_stop: bool,
-    should_regenerate: bool,
+/// Pending regeneration scope. All subsumes Specific — if both are requested
+/// before the main loop consumes the request, All wins.
+enum RegenerateScope {
+    All,
+    Specific(HashSet<String>),
 }
 
-struct SignalNotifier {
-    state: Mutex<SignalState>,
+struct CommandState {
+    should_stop: bool,
+    pending_regenerate: Option<RegenerateScope>,
+}
+
+struct CommandNotifier {
+    state: Mutex<CommandState>,
     cvar: Condvar,
 }
 
-impl SignalNotifier {
+impl CommandNotifier {
     fn new() -> Self {
         Self {
-            state: Mutex::new(SignalState {
+            state: Mutex::new(CommandState {
                 should_stop: false,
-                should_regenerate: false,
+                pending_regenerate: None,
             }),
             cvar: Condvar::new(),
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, SignalState> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, CommandState> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -207,10 +275,31 @@ impl SignalNotifier {
         self.cvar.notify_one();
     }
 
+    fn request_stop(&self) {
+        self.lock().should_stop = true;
+        self.notify();
+    }
+
+    fn request_regenerate(&self, targets: Vec<String>) {
+        let mut state = self.lock();
+        state.pending_regenerate = Some(if targets.is_empty() {
+            RegenerateScope::All
+        } else {
+            match state.pending_regenerate.take() {
+                Some(RegenerateScope::All) => RegenerateScope::All,
+                Some(RegenerateScope::Specific(mut existing)) => {
+                    existing.extend(targets);
+                    RegenerateScope::Specific(existing)
+                }
+                None => RegenerateScope::Specific(targets.into_iter().collect()),
+            }
+        });
+        self.notify();
+    }
+
     fn wait_timeout(&self, timeout: Duration) {
         let state = self.lock();
-        // Only sleep if no signal is pending — otherwise the notify already fired
-        if !state.should_stop && !state.should_regenerate {
+        if !state.should_stop && state.pending_regenerate.is_none() {
             let _ = self.cvar.wait_timeout(state, timeout);
         }
     }
@@ -464,95 +553,107 @@ fn spawn_window_title_generation(
     });
 }
 
-fn cmd_stop() {
-    let Some(pid) = read_pid() else {
-        eprintln!("tmux-ai-titles: no PID file found, daemon is not running");
-        std::process::exit(1);
-    };
-
-    if !process_is_running(pid) {
-        eprintln!(
-            "tmux-ai-titles: stale PID file (process {} not running), cleaning up",
-            pid
-        );
-        remove_pid_file();
-        std::process::exit(1);
+fn handle_request(req: Request, notifier: &CommandNotifier) -> String {
+    match req {
+        Request::Stop => {
+            notifier.request_stop();
+            "ok stopping".into()
+        }
+        Request::Regenerate(targets) => {
+            let n = targets.len();
+            notifier.request_regenerate(targets);
+            if n == 0 {
+                "ok regenerating all".into()
+            } else {
+                format!("ok regenerating {n} target(s)")
+            }
+        }
+        Request::Status => format!("ok pid={} running", std::process::id()),
     }
+}
 
-    // Send SIGTERM
-    let status = Command::new("kill").args([&pid.to_string()]).status();
+fn spawn_socket_listener(listener: UnixListener, notifier: Arc<CommandNotifier>) {
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let notifier = notifier.clone();
+            thread::spawn(move || {
+                let Ok(read_stream) = stream.try_clone() else {
+                    return;
+                };
+                let mut reader = BufReader::new(read_stream);
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() {
+                    return;
+                }
+                let response = match line.trim().parse::<Request>() {
+                    Ok(req) => handle_request(req, &notifier),
+                    Err(ParseError::Empty) => "err empty command".into(),
+                    Err(ParseError::Unknown(c)) => format!("err unknown command: {c}"),
+                };
+                let mut writer = stream;
+                let _ = writeln!(writer, "{response}");
+            });
+        }
+    });
+}
 
-    match status {
-        Ok(s) if s.success() => eprintln!("tmux-ai-titles: sent SIGTERM to process {}", pid),
-        _ => {
-            eprintln!("tmux-ai-titles: failed to send SIGTERM to process {}", pid);
+fn cmd_stop() {
+    match send_request(&Request::Stop) {
+        Ok(resp) => eprintln!("tmux-ai-titles: {resp}"),
+        Err(e) => {
+            eprintln!("tmux-ai-titles: daemon is not running ({e})");
             std::process::exit(1);
         }
     }
 }
 
-fn cmd_regenerate() {
-    let Some(pid) = read_pid() else {
-        eprintln!("tmux-ai-titles: no PID file found, daemon is not running");
-        std::process::exit(1);
-    };
-
-    if !process_is_running(pid) {
-        eprintln!(
-            "tmux-ai-titles: stale PID file (process {} not running), cleaning up",
-            pid
-        );
-        remove_pid_file();
-        std::process::exit(1);
-    }
-
-    let status = Command::new("kill")
-        .args(["-HUP", &pid.to_string()])
-        .status();
-
-    match status {
-        Ok(s) if s.success() => eprintln!(
-            "tmux-ai-titles: sent SIGHUP to process {} (will regenerate all titles)",
-            pid
-        ),
-        _ => {
-            eprintln!("tmux-ai-titles: failed to send SIGHUP to process {}", pid);
+fn cmd_regenerate(targets: Vec<String>) {
+    match send_request(&Request::Regenerate(targets)) {
+        Ok(resp) => eprintln!("tmux-ai-titles: {resp}"),
+        Err(e) => {
+            eprintln!("tmux-ai-titles: daemon is not running ({e})");
             std::process::exit(1);
         }
     }
 }
 
 fn cmd_status() {
-    let Some(pid) = read_pid() else {
-        println!("tmux-ai-titles: not running (no PID file)");
-        std::process::exit(1);
-    };
-
-    if process_is_running(pid) {
-        println!("tmux-ai-titles: running (PID {})", pid);
-    } else {
-        println!(
-            "tmux-ai-titles: not running (stale PID file for process {})",
-            pid
-        );
-        remove_pid_file();
-        std::process::exit(1);
+    match send_request(&Request::Status) {
+        Ok(resp) => println!("tmux-ai-titles: {resp}"),
+        Err(_) => {
+            println!("tmux-ai-titles: not running");
+            std::process::exit(1);
+        }
     }
 }
 
 fn cmd_start(args: StartArgs) {
-    if !args.foreground {
-        // Check if already running
-        if let Some(pid) = read_pid() {
-            if process_is_running(pid) {
-                eprintln!("tmux-ai-titles: already running (PID {})", pid);
-                std::process::exit(1);
-            }
-            // Stale PID file, clean up
-            remove_pid_file();
-        }
+    let sock_path = socket_path();
 
-        write_pid_file();
+    let listener = match bind_socket(&sock_path) {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            eprintln!(
+                "tmux-ai-titles: already running (socket {} is in use)",
+                sock_path.display()
+            );
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!(
+                "tmux-ai-titles: failed to bind socket {}: {}",
+                sock_path.display(),
+                e
+            );
+            std::process::exit(1);
+        }
+    };
+
+    // Fork BEFORE spawning any threads — fork() with live threads is UB.
+    // The listening socket fd is inherited by the child across fork.
+    if !args.no_bg {
+        daemonize();
     }
 
     let regen_delay = Duration::from_secs(args.regenerate_delay);
@@ -561,29 +662,27 @@ fn cmd_start(args: StartArgs) {
     let in_flight: InFlight = Arc::new(Mutex::new(HashSet::new()));
     let model: Arc<str> = Arc::from(args.model.as_str());
 
-    let signals_notifier = Arc::new(SignalNotifier::new());
+    let notifier = Arc::new(CommandNotifier::new());
 
-    let mut signals = Signals::new([SIGTERM, SIGHUP]).expect("failed to register signal handlers");
+    spawn_socket_listener(listener, notifier.clone());
 
+    // Keep SIGTERM as a fallback so `kill` still shuts the daemon down cleanly.
     {
-        let notifier = signals_notifier.clone();
+        let notifier = notifier.clone();
+        let mut signals = Signals::new([SIGTERM]).expect("failed to register signal handlers");
         thread::spawn(move || {
             for sig in signals.forever() {
-                let mut state = notifier.lock();
-                match sig {
-                    SIGTERM => state.should_stop = true,
-                    SIGHUP => state.should_regenerate = true,
-                    _ => continue,
+                if sig == SIGTERM {
+                    notifier.request_stop();
                 }
-                drop(state);
-                notifier.notify();
             }
         });
     }
 
     eprintln!(
-        "tmux-ai-titles: starting (pid={}, model={}, poll={}s, regen_delay={}s, capture={}, hash={})",
+        "tmux-ai-titles: starting (pid={}, socket={}, model={}, poll={}s, regen_delay={}s, capture={}, hash={})",
         std::process::id(),
+        sock_path.display(),
         model,
         args.poll_interval,
         args.regenerate_delay,
@@ -595,23 +694,44 @@ fn cmd_start(args: StartArgs) {
     let mut window_states: HashMap<String, ChangeTracker> = HashMap::new();
 
     loop {
-        {
-            let mut state = signals_notifier.lock();
+        let regenerate_scope = {
+            let mut state = notifier.lock();
 
             if state.should_stop {
-                eprintln!("tmux-ai-titles: received SIGTERM, shutting down");
-                remove_pid_file();
+                eprintln!("tmux-ai-titles: stop requested, shutting down");
+                let _ = std::fs::remove_file(&sock_path);
                 break;
             }
 
-            if state.should_regenerate {
-                eprintln!("tmux-ai-titles: received SIGHUP, clearing generated flags");
-                state.should_regenerate = false;
-                for s in pane_states.values_mut() {
-                    s.has_generated = false;
+            state.pending_regenerate.take()
+        };
+
+        if let Some(scope) = regenerate_scope {
+            match &scope {
+                RegenerateScope::All => {
+                    eprintln!("tmux-ai-titles: regenerate requested for all panes/windows");
+                    for s in pane_states.values_mut() {
+                        s.has_generated = false;
+                    }
+                    for s in window_states.values_mut() {
+                        s.has_generated = false;
+                    }
                 }
-                for s in window_states.values_mut() {
-                    s.has_generated = false;
+                RegenerateScope::Specific(ids) => {
+                    eprintln!(
+                        "tmux-ai-titles: regenerate requested for {}",
+                        ids.iter().map(String::as_str).collect::<Vec<_>>().join(" ")
+                    );
+                    for (id, s) in pane_states.iter_mut() {
+                        if ids.contains(id) {
+                            s.has_generated = false;
+                        }
+                    }
+                    for (id, s) in window_states.iter_mut() {
+                        if ids.contains(id) {
+                            s.has_generated = false;
+                        }
+                    }
                 }
             }
         }
@@ -750,8 +870,8 @@ fn cmd_start(args: StartArgs) {
             }
         }
 
-        // Wait for poll interval or until a signal wakes us
-        signals_notifier.wait_timeout(poll_interval);
+        // Wait for poll interval or until a signal/command wakes us
+        notifier.wait_timeout(poll_interval);
     }
 }
 
@@ -761,7 +881,7 @@ fn main() {
     match cli.command {
         Commands::Start(args) => cmd_start(args),
         Commands::Stop => cmd_stop(),
-        Commands::Regenerate => cmd_regenerate(),
+        Commands::Regenerate { targets } => cmd_regenerate(targets),
         Commands::Status => cmd_status(),
     }
 }

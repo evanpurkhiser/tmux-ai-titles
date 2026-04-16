@@ -49,7 +49,7 @@ cp target/release/tmux-ai-titles ~/.local/bin/
 ## Usage
 
 ```bash
-# Start the daemon
+# Start the daemon (forks to the background by default)
 tmux-ai-titles start
 
 # Check if it's running
@@ -58,11 +58,14 @@ tmux-ai-titles status
 # Force regeneration of all titles
 tmux-ai-titles regenerate
 
+# Regenerate titles for specific panes and/or windows only
+tmux-ai-titles regenerate %16 %17 @3
+
 # Stop the daemon
 tmux-ai-titles stop
 ```
 
-The daemon manages a PID file in `$XDG_RUNTIME_DIR` (or `/tmp`) to ensure only one instance runs at a time.
+The daemon listens on a Unix socket at `$XDG_RUNTIME_DIR/tmux-ai-titles.sock` (or `/tmp` if `XDG_RUNTIME_DIR` is unset). `status`, `stop`, and `regenerate` all talk to the daemon over that socket, so only one instance can run at a time.
 
 ## tmux configuration
 
@@ -89,7 +92,6 @@ All options are passed to the `start` subcommand:
 | `--poll-interval` | 5 | How often to poll panes for changes (seconds) |
 | `--regenerate-delay` | 300 | Seconds after content change before regenerating |
 | `--capture-lines` | 250 | Lines of buffer to send for pane title generation |
-| `--foreground` | | Run in foreground (skip PID file check) |
 | `--hash-lines` | 50 | Lines of buffer to hash for change detection |
 | `--model` | haiku | Claude model to use |
 | `--no-pane-titles` | | Disable pane title generation (window titles still work) |

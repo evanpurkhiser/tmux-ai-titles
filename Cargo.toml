@@ -12,4 +12,5 @@ categories = ["command-line-utilities"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+fork = "0.7"
 signal-hook = "0.3"
