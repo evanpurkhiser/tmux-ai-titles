@@ -192,8 +192,7 @@ fn send_request(req: &Request) -> std::io::Result<String> {
 struct ChangeTracker {
     last_hash: u64,
     last_changed: Instant,
-    last_generated: Instant,
-    has_generated: bool,
+    last_generated: Option<Instant>,
 }
 
 impl ChangeTracker {
@@ -201,8 +200,7 @@ impl ChangeTracker {
         Self {
             last_hash: hash,
             last_changed: now,
-            last_generated: now,
-            has_generated: false,
+            last_generated: None,
         }
     }
 
@@ -214,17 +212,21 @@ impl ChangeTracker {
     }
 
     fn should_generate(&self, now: Instant, regen_delay: Duration) -> bool {
-        if !self.has_generated {
-            true
-        } else {
-            self.last_changed > self.last_generated
-                && now.duration_since(self.last_changed) >= regen_delay
+        match self.last_generated {
+            None => true,
+            Some(last_gen) => {
+                self.last_changed > last_gen
+                    && now.duration_since(self.last_changed) >= regen_delay
+            }
         }
     }
 
     fn mark_generated(&mut self, now: Instant) {
-        self.last_generated = now;
-        self.has_generated = true;
+        self.last_generated = Some(now);
+    }
+
+    fn mark_stale(&mut self) {
+        self.last_generated = None;
     }
 }
 
@@ -710,10 +712,10 @@ fn cmd_start(args: StartArgs) {
                 RegenerateScope::All => {
                     eprintln!("tmux-ai-titles: regenerate requested for all panes/windows");
                     for s in pane_states.values_mut() {
-                        s.has_generated = false;
+                        s.mark_stale();
                     }
                     for s in window_states.values_mut() {
-                        s.has_generated = false;
+                        s.mark_stale();
                     }
                 }
                 RegenerateScope::Specific(ids) => {
@@ -723,12 +725,12 @@ fn cmd_start(args: StartArgs) {
                     );
                     for (id, s) in pane_states.iter_mut() {
                         if ids.contains(id) {
-                            s.has_generated = false;
+                            s.mark_stale();
                         }
                     }
                     for (id, s) in window_states.iter_mut() {
                         if ids.contains(id) {
-                            s.has_generated = false;
+                            s.mark_stale();
                         }
                     }
                 }
