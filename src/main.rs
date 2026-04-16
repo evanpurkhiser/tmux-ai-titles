@@ -268,7 +268,7 @@ impl CommandNotifier {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, CommandState> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
+        self.state.lock().unwrap()
     }
 
     fn notify(&self) {
@@ -460,7 +460,7 @@ fn spawn_pane_title_generation(
         } else {
             title_map
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .unwrap()
                 .get(&pane_id)
                 .cloned()
                 .unwrap_or_default()
@@ -521,15 +521,12 @@ fn spawn_pane_title_generation(
             }
             title_map
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .unwrap()
                 .insert(pane_id.clone(), title.clone());
             eprintln!("pane {} -> {}", pane_id, title);
         }
 
-        in_flight
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&pane_id);
+        in_flight.lock().unwrap().remove(&pane_id);
     });
 }
 
@@ -546,10 +543,7 @@ fn spawn_window_title_generation(
             eprintln!("window {} -> {}", window_id, title);
         }
 
-        in_flight
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&window_id);
+        in_flight.lock().unwrap().remove(&window_id);
     });
 }
 
@@ -747,7 +741,7 @@ fn cmd_start(args: StartArgs) {
         // Clean up title_map for removed panes
         title_map
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap()
             .retain(|id, _| active_pane_ids.contains(id.as_str()));
 
         let now = Instant::now();
@@ -772,7 +766,7 @@ fn cmd_start(args: StartArgs) {
                 // Atomically check-and-insert to avoid TOCTOU
                 let was_inserted = in_flight
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .unwrap()
                     .insert(pane.pane_id.clone());
 
                 if !was_inserted {
@@ -796,8 +790,8 @@ fn cmd_start(args: StartArgs) {
         // --- Window titles ---
         if !args.no_window_titles {
             let mut window_panes: HashMap<&str, Vec<(String, String, bool)>> = HashMap::new();
-            let titles_snapshot = title_map.lock().unwrap_or_else(|e| e.into_inner());
-            let in_flight_snapshot = in_flight.lock().unwrap_or_else(|e| e.into_inner());
+            let titles_snapshot = title_map.lock().unwrap();
+            let in_flight_snapshot = in_flight.lock().unwrap();
 
             for pane in &panes {
                 let pane_in_flight = in_flight_snapshot.contains(&pane.pane_id);
@@ -845,7 +839,7 @@ fn cmd_start(args: StartArgs) {
                     // Atomically check-and-insert to avoid TOCTOU
                     let was_inserted = in_flight
                         .lock()
-                        .unwrap_or_else(|e| e.into_inner())
+                        .unwrap()
                         .insert(window_id.to_string());
 
                     if !was_inserted {
