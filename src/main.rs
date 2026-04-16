@@ -228,20 +228,20 @@ impl ChangeTracker {
 }
 
 struct PaneInfo {
-    pane_id: String,
-    window_id: String,
+    pane_id: Arc<str>,
+    window_id: Arc<str>,
     cwd: String,
     command: String,
 }
 
 /// Shared map of pane_id -> generated title, used for window title generation
-type TitleMap = Arc<Mutex<HashMap<String, String>>>;
+type TitleMap = Arc<Mutex<HashMap<Arc<str>, String>>>;
 
 /// Pending regeneration scope. All subsumes Specific — if both are requested
 /// before the main loop consumes the request, All wins.
 enum RegenerateScope {
     All,
-    Specific(HashSet<String>),
+    Specific(HashSet<Arc<str>>),
 }
 
 struct CommandState {
@@ -286,10 +286,10 @@ impl CommandNotifier {
             match state.pending_regenerate.take() {
                 Some(RegenerateScope::All) => RegenerateScope::All,
                 Some(RegenerateScope::Specific(mut existing)) => {
-                    existing.extend(targets);
+                    existing.extend(targets.into_iter().map(Arc::from));
                     RegenerateScope::Specific(existing)
                 }
-                None => RegenerateScope::Specific(targets.into_iter().collect()),
+                None => RegenerateScope::Specific(targets.into_iter().map(Arc::from).collect()),
             }
         });
         self.notify();
@@ -346,8 +346,8 @@ fn list_panes() -> Vec<PaneInfo> {
         .lines()
         .filter_map(|line| {
             let mut parts = line.splitn(4, '\t');
-            let pane_id = parts.next()?.to_string();
-            let window_id = parts.next()?.to_string();
+            let pane_id = Arc::from(parts.next()?);
+            let window_id = Arc::from(parts.next()?);
             let command = parts.next().unwrap_or("").to_string();
             let cwd = parts.next().unwrap_or("").to_string();
             Some(PaneInfo {
@@ -436,14 +436,14 @@ fn get_pane_title(pane_id: &str) -> String {
 }
 
 fn spawn_pane_title_generation(
-    pane_id: String,
+    pane_id: Arc<str>,
     buffer: String,
     cwd: String,
     command: String,
     model: Arc<str>,
     set_title: bool,
     title_map: TitleMap,
-    done_tx: mpsc::Sender<String>,
+    done_tx: mpsc::Sender<Arc<str>>,
 ) {
     thread::spawn(move || {
         // Relaxed ordering is sufficient here: the spinner thread and the
@@ -451,7 +451,6 @@ fn spawn_pane_title_generation(
         // simple "stop" signal, so no acquire/release synchronization is needed.
         let done = Arc::new(AtomicBool::new(false));
         let _guard = SpinnerGuard { done: done.clone() };
-        let pane_id_clone = pane_id.clone();
 
         let current_title = if set_title {
             get_pane_title(&pane_id)
@@ -467,16 +466,16 @@ fn spawn_pane_title_generation(
         // Only show spinner if we're setting pane titles
         let spinner = if set_title {
             let done_clone = done.clone();
-            let pane_id_clone2 = pane_id_clone.clone();
+            let pane_id_spinner = pane_id.clone();
             let current_title2 = current_title.clone();
             Some(thread::spawn(move || {
                 let mut frame = 0;
                 while !done_clone.load(Ordering::Relaxed) {
                     let spinner = SPINNER_FRAMES[frame % SPINNER_FRAMES.len()];
                     if current_title2.is_empty() {
-                        set_pane_title(&pane_id_clone2, spinner);
+                        set_pane_title(&pane_id_spinner, spinner);
                     } else {
-                        set_pane_title(&pane_id_clone2, &format!("{spinner} {current_title2}"));
+                        set_pane_title(&pane_id_spinner, &format!("{spinner} {current_title2}"));
                     }
                     frame += 1;
                     thread::sleep(Duration::from_millis(80));
@@ -529,10 +528,10 @@ fn spawn_pane_title_generation(
 }
 
 fn spawn_window_title_generation(
-    window_id: String,
+    window_id: Arc<str>,
     pane_titles: String,
     model: Arc<str>,
-    done_tx: mpsc::Sender<String>,
+    done_tx: mpsc::Sender<Arc<str>>,
 ) {
     thread::spawn(move || {
         let title = call_claude(&model, WINDOW_TITLE_PROMPT, &pane_titles);
@@ -651,8 +650,8 @@ fn cmd_start(args: StartArgs) {
     let regen_delay = Duration::from_secs(args.regenerate_delay);
     let poll_interval = Duration::from_secs(args.poll_interval);
     let title_map: TitleMap = Arc::new(Mutex::new(HashMap::new()));
-    let mut in_flight: HashSet<String> = HashSet::new();
-    let (done_tx, done_rx) = mpsc::channel::<String>();
+    let mut in_flight: HashSet<Arc<str>> = HashSet::new();
+    let (done_tx, done_rx) = mpsc::channel::<Arc<str>>();
     let model: Arc<str> = Arc::from(args.model.as_str());
 
     let notifier = Arc::new(CommandNotifier::new());
@@ -683,8 +682,8 @@ fn cmd_start(args: StartArgs) {
         args.hash_lines
     );
 
-    let mut pane_states: HashMap<String, ChangeTracker> = HashMap::new();
-    let mut window_states: HashMap<String, ChangeTracker> = HashMap::new();
+    let mut pane_states: HashMap<Arc<str>, ChangeTracker> = HashMap::new();
+    let mut window_states: HashMap<Arc<str>, ChangeTracker> = HashMap::new();
 
     loop {
         // Reap completed workers before deciding what to spawn this cycle.
@@ -718,7 +717,7 @@ fn cmd_start(args: StartArgs) {
                 RegenerateScope::Specific(ids) => {
                     eprintln!(
                         "tmux-ai-titles: regenerate requested for {}",
-                        ids.iter().map(String::as_str).collect::<Vec<_>>().join(" ")
+                        ids.iter().map(|s| &**s).collect::<Vec<_>>().join(" ")
                     );
                     for (id, s) in pane_states.iter_mut() {
                         if ids.contains(id) {
@@ -736,17 +735,17 @@ fn cmd_start(args: StartArgs) {
 
         let panes = list_panes();
 
-        let active_pane_ids: HashSet<&str> = panes.iter().map(|p| p.pane_id.as_str()).collect();
-        pane_states.retain(|id, _| active_pane_ids.contains(id.as_str()));
+        let active_pane_ids: HashSet<&str> = panes.iter().map(|p| &*p.pane_id).collect();
+        pane_states.retain(|id, _| active_pane_ids.contains(&**id));
 
-        let active_window_ids: HashSet<&str> = panes.iter().map(|p| p.window_id.as_str()).collect();
-        window_states.retain(|id, _| active_window_ids.contains(id.as_str()));
+        let active_window_ids: HashSet<&str> = panes.iter().map(|p| &*p.window_id).collect();
+        window_states.retain(|id, _| active_window_ids.contains(&**id));
 
         // Clean up title_map for removed panes
         title_map
             .lock()
             .unwrap()
-            .retain(|id, _| active_pane_ids.contains(id.as_str()));
+            .retain(|id, _| active_pane_ids.contains(&**id));
 
         let now = Instant::now();
 
@@ -787,7 +786,7 @@ fn cmd_start(args: StartArgs) {
 
         // --- Window titles ---
         if !args.no_window_titles {
-            let mut window_panes: HashMap<&str, Vec<(String, String, bool)>> = HashMap::new();
+            let mut window_panes: HashMap<Arc<str>, Vec<(String, String, bool)>> = HashMap::new();
             let titles_snapshot = title_map.lock().unwrap();
 
             for pane in &panes {
@@ -800,7 +799,7 @@ fn cmd_start(args: StartArgs) {
                     .unwrap_or_else(|| get_pane_title(&pane.pane_id));
 
                 window_panes
-                    .entry(pane.window_id.as_str())
+                    .entry(pane.window_id.clone())
                     .or_default()
                     .push((title, pane.cwd.clone(), pane_in_flight));
             }
@@ -815,7 +814,7 @@ fn cmd_start(args: StartArgs) {
                 let hash = hash_str(&combined);
 
                 let state = window_states
-                    .entry(window_id.to_string())
+                    .entry(window_id.clone())
                     .or_insert_with(|| ChangeTracker::new(hash, now));
 
                 state.update_hash(hash, now);
@@ -832,7 +831,7 @@ fn cmd_start(args: StartArgs) {
                         continue;
                     }
 
-                    if !in_flight.insert(window_id.to_string()) {
+                    if !in_flight.insert(window_id.clone()) {
                         continue;
                     }
 
@@ -844,7 +843,7 @@ fn cmd_start(args: StartArgs) {
                         .join("\n");
 
                     spawn_window_title_generation(
-                        window_id.to_string(),
+                        window_id.clone(),
                         input,
                         model.clone(),
                         done_tx.clone(),
