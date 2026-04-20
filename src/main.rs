@@ -150,10 +150,11 @@ impl fmt::Display for Request {
 /// in the child; the parent exits inside `fork::daemon`. Must be called
 /// before any threads are spawned — fork() with live threads is UB.
 ///
-/// Args are `nochdir=true` (stay in cwd) and `noclose=true` (inherit stdio so
-/// shell redirections like `start 2>log` keep working).
+/// Args are `nochdir=true` (stay in cwd) and `noclose=false` (redirect
+/// stdin/stdout/stderr to /dev/null so the daemon doesn't write to the
+/// launching tty after the parent returns).
 fn daemonize() {
-    if let Err(errno) = fork::daemon(true, true) {
+    if let Err(errno) = fork::daemon(true, false) {
         eprintln!("tmux-ai-titles: failed to daemonize (errno {errno})");
         std::process::exit(1);
     }
@@ -645,6 +646,21 @@ fn cmd_start(args: StartArgs) {
         }
     };
 
+    let model: Arc<str> = Arc::from(args.model.as_str());
+
+    // Print the startup banner before forking so the user sees confirmation on
+    // the launching tty. Post-fork, stdio is redirected to /dev/null by
+    // daemonize(), so any further eprintln! is silently dropped.
+    eprintln!(
+        "tmux-ai-titles: starting (socket={}, model={}, poll={}s, regen_delay={}s, capture={}, hash={})",
+        sock_path.display(),
+        model,
+        args.poll_interval,
+        args.regenerate_delay,
+        args.capture_lines,
+        args.hash_lines
+    );
+
     // Fork BEFORE spawning any threads — fork() with live threads is UB.
     // The listening socket fd is inherited by the child across fork.
     if !args.no_bg {
@@ -656,7 +672,6 @@ fn cmd_start(args: StartArgs) {
     let title_map: TitleMap = Arc::new(Mutex::new(HashMap::new()));
     let mut in_flight: HashSet<Arc<str>> = HashSet::new();
     let (done_tx, done_rx) = mpsc::channel::<Arc<str>>();
-    let model: Arc<str> = Arc::from(args.model.as_str());
 
     let notifier = Arc::new(CommandNotifier::new());
 
@@ -674,17 +689,6 @@ fn cmd_start(args: StartArgs) {
             }
         });
     }
-
-    eprintln!(
-        "tmux-ai-titles: starting (pid={}, socket={}, model={}, poll={}s, regen_delay={}s, capture={}, hash={})",
-        std::process::id(),
-        sock_path.display(),
-        model,
-        args.poll_interval,
-        args.regenerate_delay,
-        args.capture_lines,
-        args.hash_lines
-    );
 
     let mut pane_states: HashMap<Arc<str>, ChangeTracker> = HashMap::new();
     let mut window_states: HashMap<Arc<str>, ChangeTracker> = HashMap::new();
