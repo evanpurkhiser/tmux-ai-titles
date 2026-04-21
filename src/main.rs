@@ -1,3 +1,5 @@
+mod stats;
+
 use clap::{Parser, Subcommand};
 use signal_hook::consts::SIGTERM;
 use signal_hook::iterator::Signals;
@@ -6,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -17,6 +19,10 @@ use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use stats::{InFlight, Kind as StatsKind, Stats};
+
+type SharedStats = Arc<Mutex<Stats>>;
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠚", "⠞", "⠖", "⠦", "⠴", "⠲", "⠳", "⠓"];
 
@@ -62,6 +68,8 @@ enum Commands {
     },
     /// Check if the daemon is running
     Status,
+    /// Show rolling generation stats
+    Stats,
 }
 
 #[derive(Parser)]
@@ -120,6 +128,7 @@ enum Request {
     Stop,
     Regenerate(Vec<String>),
     Status,
+    Stats,
 }
 
 enum ParseError {
@@ -136,6 +145,7 @@ impl FromStr for Request {
         match cmd {
             "stop" => Ok(Request::Stop),
             "status" => Ok(Request::Status),
+            "stats" => Ok(Request::Stats),
             "regenerate" => Ok(Request::Regenerate(parts.map(str::to_string).collect())),
             other => Err(ParseError::Unknown(other.to_string())),
         }
@@ -147,6 +157,7 @@ impl fmt::Display for Request {
         match self {
             Request::Stop => f.write_str("stop"),
             Request::Status => f.write_str("status"),
+            Request::Stats => f.write_str("stats"),
             Request::Regenerate(targets) if targets.is_empty() => f.write_str("regenerate"),
             Request::Regenerate(targets) => write!(f, "regenerate {}", targets.join(" ")),
         }
@@ -184,16 +195,15 @@ fn bind_socket(path: &Path) -> std::io::Result<UnixListener> {
     }
 }
 
-/// Send a request to the daemon and return its response line.
+/// Send a request to the daemon and return its response (may be multi-line).
 fn send_request(req: &Request) -> std::io::Result<String> {
     let mut stream = UnixStream::connect(socket_path())?;
     stream.write_all(req.to_string().as_bytes())?;
     stream.write_all(b"\n")?;
     stream.shutdown(Shutdown::Write)?;
-    let mut reader = BufReader::new(stream);
     let mut resp = String::new();
-    reader.read_line(&mut resp)?;
-    Ok(resp.trim().to_string())
+    stream.read_to_string(&mut resp)?;
+    Ok(resp.trim_end().to_string())
 }
 
 /// Tracks content changes and generation timing for both panes and windows.
@@ -466,8 +476,10 @@ fn spawn_pane_title_generation(
     model: Arc<str>,
     set_title: bool,
     title_map: TitleMap,
+    stats: SharedStats,
     done_tx: mpsc::Sender<Arc<str>>,
 ) {
+    let in_flight = InFlight::new(stats);
     thread::spawn(move || {
         // Relaxed ordering is sufficient here: the spinner thread and the
         // generation thread share no other state through this flag — it is a
@@ -545,6 +557,7 @@ fn spawn_pane_title_generation(
                 .unwrap()
                 .insert(pane_id.clone(), title.clone());
             eprintln!("pane {} -> {}", pane_id, title);
+            in_flight.success(StatsKind::Pane);
         }
 
         done_tx.send(pane_id).ok();
@@ -555,20 +568,23 @@ fn spawn_window_title_generation(
     window_id: Arc<str>,
     pane_titles: String,
     model: Arc<str>,
+    stats: SharedStats,
     done_tx: mpsc::Sender<Arc<str>>,
 ) {
+    let in_flight = InFlight::new(stats);
     thread::spawn(move || {
         let title = call_claude(&model, WINDOW_TITLE_PROMPT, &pane_titles);
         if let Some(title) = title {
             set_window_title(&window_id, &title);
             eprintln!("window {} -> {}", window_id, title);
+            in_flight.success(StatsKind::Window);
         }
 
         done_tx.send(window_id).ok();
     });
 }
 
-fn handle_request(req: Request, notifier: &CommandNotifier) -> String {
+fn handle_request(req: Request, notifier: &CommandNotifier, stats: &SharedStats) -> String {
     match req {
         Request::Stop => {
             notifier.request_stop();
@@ -584,14 +600,20 @@ fn handle_request(req: Request, notifier: &CommandNotifier) -> String {
             }
         }
         Request::Status => format!("ok pid={} running", std::process::id()),
+        Request::Stats => stats.lock().unwrap().render(Instant::now()),
     }
 }
 
-fn spawn_socket_listener(listener: UnixListener, notifier: Arc<CommandNotifier>) {
+fn spawn_socket_listener(
+    listener: UnixListener,
+    notifier: Arc<CommandNotifier>,
+    stats: SharedStats,
+) {
     thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
             let notifier = notifier.clone();
+            let stats = stats.clone();
             thread::spawn(move || {
                 let Ok(read_stream) = stream.try_clone() else {
                     return;
@@ -602,7 +624,7 @@ fn spawn_socket_listener(listener: UnixListener, notifier: Arc<CommandNotifier>)
                     return;
                 }
                 let response = match line.trim().parse::<Request>() {
-                    Ok(req) => handle_request(req, &notifier),
+                    Ok(req) => handle_request(req, &notifier, &stats),
                     Err(ParseError::Empty) => "err empty command".into(),
                     Err(ParseError::Unknown(c)) => format!("err unknown command: {c}"),
                 };
@@ -638,6 +660,16 @@ fn cmd_status() {
         Ok(resp) => println!("tmux-ai-titles: {resp}"),
         Err(_) => {
             println!("tmux-ai-titles: not running");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_stats() {
+    match send_request(&Request::Stats) {
+        Ok(resp) => println!("{resp}"),
+        Err(e) => {
+            eprintln!("tmux-ai-titles: daemon is not running ({e})");
             std::process::exit(1);
         }
     }
@@ -695,8 +727,9 @@ fn cmd_start(args: StartArgs) {
     let (done_tx, done_rx) = mpsc::channel::<Arc<str>>();
 
     let notifier = Arc::new(CommandNotifier::new());
+    let stats: SharedStats = Arc::new(Mutex::new(Stats::new(Instant::now())));
 
-    spawn_socket_listener(listener, notifier.clone());
+    spawn_socket_listener(listener, notifier.clone(), stats.clone());
 
     // Keep SIGTERM as a fallback so `kill` still shuts the daemon down cleanly.
     {
@@ -807,6 +840,7 @@ fn cmd_start(args: StartArgs) {
                     model.clone(),
                     !args.no_pane_titles,
                     title_map.clone(),
+                    stats.clone(),
                     done_tx.clone(),
                 );
                 state.mark_generated(now);
@@ -875,6 +909,7 @@ fn cmd_start(args: StartArgs) {
                         window_id.clone(),
                         input,
                         model.clone(),
+                        stats.clone(),
                         done_tx.clone(),
                     );
                     state.mark_generated(now);
@@ -895,5 +930,6 @@ fn main() {
         Commands::Stop => cmd_stop(),
         Commands::Regenerate { targets } => cmd_regenerate(targets),
         Commands::Status => cmd_status(),
+        Commands::Stats => cmd_stats(),
     }
 }

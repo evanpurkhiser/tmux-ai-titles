@@ -61,6 +61,9 @@ tmux-ai-titles regenerate
 # Regenerate titles for specific panes and/or windows only
 tmux-ai-titles regenerate %16 %17 @3
 
+# Show rolling generation stats (uptime, totals, last-hour count, etc.)
+tmux-ai-titles stats
+
 # Stop the daemon
 tmux-ai-titles stop
 ```
