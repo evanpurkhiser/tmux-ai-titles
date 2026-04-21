@@ -66,7 +66,14 @@ enum Commands {
 
 #[derive(Parser)]
 struct StartArgs {
-    /// Seconds to wait after content changes before regenerating
+    /// Seconds of stable (unchanging) buffer content required before generating
+    /// a title. Prevents useless titles from nearly-empty buffers and avoids
+    /// retitling while a command is still producing output.
+    #[arg(long, default_value_t = 30)]
+    stable_delay: u64,
+
+    /// Maximum seconds to wait before (re)generating a title, even if the
+    /// buffer is continuously changing. Acts as a ceiling on --stable-delay.
     #[arg(long, default_value_t = 300)]
     regenerate_delay: u64,
 
@@ -194,6 +201,7 @@ struct ChangeTracker {
     last_hash: u64,
     last_changed: Instant,
     last_generated: Option<Instant>,
+    created: Instant,
 }
 
 impl ChangeTracker {
@@ -202,6 +210,7 @@ impl ChangeTracker {
             last_hash: hash,
             last_changed: now,
             last_generated: None,
+            created: now,
         }
     }
 
@@ -212,14 +221,24 @@ impl ChangeTracker {
         }
     }
 
-    fn should_generate(&self, now: Instant, regen_delay: Duration) -> bool {
-        match self.last_generated {
-            None => true,
-            Some(last_gen) => {
-                self.last_changed > last_gen
-                    && now.duration_since(self.last_changed) >= regen_delay
+    /// Generate when the buffer has been stable for `stable_delay`, or when
+    /// we've been waiting `max_delay` since the last generation (or since the
+    /// pane was first seen) — whichever comes first. After an initial
+    /// generation, only fires again if the buffer has actually changed.
+    fn should_generate(
+        &self,
+        now: Instant,
+        stable_delay: Duration,
+        max_delay: Duration,
+    ) -> bool {
+        if let Some(last_gen) = self.last_generated {
+            if self.last_changed <= last_gen {
+                return false;
             }
         }
+        let anchor = self.last_generated.unwrap_or(self.created);
+        now.duration_since(self.last_changed) >= stable_delay
+            || now.duration_since(anchor) >= max_delay
     }
 
     fn mark_generated(&mut self, now: Instant) {
@@ -652,10 +671,11 @@ fn cmd_start(args: StartArgs) {
     // the launching tty. Post-fork, stdio is redirected to /dev/null by
     // daemonize(), so any further eprintln! is silently dropped.
     eprintln!(
-        "tmux-ai-titles: starting (socket={}, model={}, poll={}s, regen_delay={}s, capture={}, hash={})",
+        "tmux-ai-titles: starting (socket={}, model={}, poll={}s, stable_delay={}s, regen_delay={}s, capture={}, hash={})",
         sock_path.display(),
         model,
         args.poll_interval,
+        args.stable_delay,
         args.regenerate_delay,
         args.capture_lines,
         args.hash_lines
@@ -668,6 +688,7 @@ fn cmd_start(args: StartArgs) {
     }
 
     let regen_delay = Duration::from_secs(args.regenerate_delay);
+    let stable_delay = Duration::from_secs(args.stable_delay);
     let poll_interval = Duration::from_secs(args.poll_interval);
     let title_map: TitleMap = Arc::new(Mutex::new(HashMap::new()));
     let mut in_flight: HashSet<Arc<str>> = HashSet::new();
@@ -773,7 +794,7 @@ fn cmd_start(args: StartArgs) {
 
             state.update_hash(hash, now);
 
-            if state.should_generate(now, regen_delay) {
+            if state.should_generate(now, stable_delay, regen_delay) {
                 if !in_flight.insert(pane.pane_id.clone()) {
                     continue;
                 }
@@ -827,7 +848,7 @@ fn cmd_start(args: StartArgs) {
 
                 state.update_hash(hash, now);
 
-                if state.should_generate(now, regen_delay) {
+                if state.should_generate(now, stable_delay, regen_delay) {
                     // Skip panes that are currently generating titles
                     let real_titles: Vec<(&str, &str)> = titles
                         .iter()

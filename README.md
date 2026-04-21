@@ -8,7 +8,7 @@ A lightweight daemon that automatically generates descriptive titles for tmux pa
 
 The daemon polls all tmux panes every 5 seconds, hashing the last 50 lines of each pane to detect changes.
 
-**Pane titles**: On first sight, it captures the last 500 lines from the pane buffer, sends them to Claude CLI (`claude -p --model haiku`), and generates a 4-5 word title. Subsequent regenerations happen when content has changed and 5 minutes have passed since the change.
+**Pane titles**: Once a pane's buffer has been stable for 30 seconds (or 5 minutes have elapsed with continuous churn), it captures the last 500 lines from the pane buffer, sends them to Claude CLI (`claude -p --model haiku`), and generates a 4-5 word title. The same stability/max-delay rule drives regeneration whenever the buffer changes.
 
 **Window titles**: After pane titles are generated, the daemon collects all pane titles and their working directories within each window and generates a 1-2 word window title that captures the overall theme.
 
@@ -90,7 +90,8 @@ All options are passed to the `start` subcommand:
 | Flag | Default | Description |
 |---|---|---|
 | `--poll-interval` | 5 | How often to poll panes for changes (seconds) |
-| `--regenerate-delay` | 300 | Seconds after content change before regenerating |
+| `--stable-delay` | 30 | Seconds of stable (unchanging) buffer required to trigger (re)generation |
+| `--regenerate-delay` | 300 | Max seconds to wait before (re)generating when the buffer keeps churning |
 | `--capture-lines` | 250 | Lines of buffer to send for pane title generation |
 | `--hash-lines` | 50 | Lines of buffer to hash for change detection |
 | `--model` | haiku | Claude model to use |
