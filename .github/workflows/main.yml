@@ -116,7 +116,7 @@ jobs:
 
   build_darwin_arm64:
     name: Build darwin/arm64
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - name: Checkout
         uses: actions/checkout@v6
