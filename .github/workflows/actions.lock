@@ -6,6 +6,7 @@ workflows:
     '.github/workflows/bump.yml':
         - 'actions/checkout@v6.1.0'
         - 'dtolnay/rust-toolchain@stable'
+        - 'evanpurkhiser/workflows@main'
         - 'swatinem/rust-cache@v2.9.3'
     '.github/workflows/main.yml':
         - 'actions/checkout@v6.1.0'
@@ -36,6 +37,11 @@ dependencies:
         commit: 'sha1-b725eda525362e7cf34af9a7243cac1e3f01a7ec'
         owner_id: 1940490
         repo_id: 260749683
+    'evanpurkhiser/workflows@main':
+        ref: 'main'
+        commit: 'sha1-f019c5f6ad0107bc2accbeda0ff8fce510d807e3'
+        owner_id: 1421724
+        repo_id: 1057625462
     'rust-lang/crates-io-auth-action@v1.0.6':
         ref: 'v1.0.6'
         commit: 'sha1-3268eb413133e2960fa4ae0e963ca76380c54cd9'
